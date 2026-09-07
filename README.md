@@ -38,6 +38,7 @@ The tool creates `.md` files next to the originals.
 - Convert a single file to Markdown
 - Convert an entire folder recursively
 - Keep generated `.md` files beside the originals
+- Extract embedded images into an `images_<name>` folder so the Markdown renders them
 - Supports Word documents
 - Supports Excel workbooks
 - Supports CSV and TSV files
@@ -55,12 +56,12 @@ The tool creates `.md` files next to the originals.
 
 | Format | Supported | Notes |
 |---|---:|---|
-| `.docx` | Yes | Converted using Pandoc |
-| `.odt` | Yes | Converted using Pandoc |
-| `.rtf` | Yes | Converted using Pandoc |
+| `.docx` | Yes | Converted using Pandoc, images extracted |
+| `.odt` | Yes | Converted using Pandoc, images extracted |
+| `.rtf` | Yes | Converted using Pandoc, images extracted |
 | `.html` | Yes | Converted using Pandoc |
 | `.htm` | Yes | Converted using Pandoc |
-| `.epub` | Yes | Converted using Pandoc |
+| `.epub` | Yes | Converted using Pandoc, images extracted |
 | `.pdf` | Yes | Text extracted with `pdftotext` |
 | `.txt` | Yes | Converted directly |
 | `.csv` | Yes | Converted to Markdown tables |
@@ -154,6 +155,17 @@ Desktop/
 └── report.md
 ```
 
+If the document contains images, they are saved next to it:
+
+```text
+Desktop/
+├── report.docx
+├── report.md
+└── images_report/
+    ├── image1.png
+    └── image2.jpeg
+```
+
 The original file is not modified.
 
 ### Convert an entire folder
@@ -170,6 +182,8 @@ Example:
 project/
 ├── proposal.docx
 ├── proposal.md
+├── images_proposal/
+│   └── image1.png
 ├── products.xlsx
 ├── products.md
 ├── research.pdf
@@ -181,6 +195,30 @@ project/
 ```
 
 Subfolders are scanned too.
+
+---
+
+## Images in documents
+
+Images embedded in Word, OpenDocument, RTF and EPUB files are extracted automatically.
+
+They are saved in a folder named `images_<name>` next to the generated Markdown file, and the Markdown links point to that folder with relative paths:
+
+```markdown
+# Quarterly Report
+
+Sales grew in every region.
+
+![](images_report/image1.png)
+```
+
+Because the links are relative, the `.md` file and its `images_` folder can be moved or committed together and the images keep rendering in GitHub, VS Code, Obsidian and other Markdown viewers.
+
+Notes:
+
+- Re-running the conversion replaces the `images_<name>` folder, just like it replaces the `.md` file
+- Documents without images do not get an images folder
+- Images in PDFs are not extracted yet
 
 ---
 
@@ -405,7 +443,8 @@ This is intentionally a lightweight CLI utility.
 Current limitations include:
 
 - Scanned PDFs are not OCR'd
-- Images inside documents are not extracted
+- Images inside PDFs are not extracted
+- Images in HTML files are not downloaded
 - Highly complex Word layouts may lose formatting
 - Complex Excel formatting is not preserved
 - Macros are not supported
@@ -421,7 +460,7 @@ Possible future improvements:
 - Linux installation support
 - Windows support
 - OCR for scanned PDFs
-- Image extraction from DOCX and PDF
+- Image extraction from PDF
 - Custom output directory
 - Overwrite confirmation
 - Dry-run mode

@@ -13,7 +13,7 @@
 
 set -u
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 SUPPORTED_EXTENSIONS=(
   "docx"
@@ -71,6 +71,10 @@ Supported formats:
   JSON
 
 The generated .md file is saved next to the original file.
+
+Images embedded in DOCX, ODT, RTF and EPUB files are extracted into
+an images_<name> folder next to the .md file, and the Markdown links
+point to them.
 
 If a folder is provided, all supported files inside that folder
 and its subfolders will be converted.
@@ -132,15 +136,116 @@ normalize_input() {
     printf '%s' "$input"
 }
 
+# Absolute path of a file, without requiring realpath/readlink -f.
+absolute_path() {
+
+    local path="$1"
+
+    printf '%s/%s' "$(cd "$(dirname "$path")" && pwd)" "$(basename "$path")"
+}
+
+# Move extracted images to the top of the images folder and fix the
+# links in the Markdown file. Prints the number of images kept.
+flatten_images() {
+
+    local markdown="$1"
+    local images_dir="$2"
+
+    python3 - "$markdown" "$images_dir" <<'PYTHON'
+import os
+import shutil
+import sys
+from urllib.parse import quote
+
+markdown_file = sys.argv[1]
+images_dir = sys.argv[2]
+base_dir = os.path.dirname(images_dir)
+
+if not os.path.isdir(images_dir):
+    print(0)
+    sys.exit(0)
+
+moves = {}
+
+# Pandoc keeps the document's internal folder layout
+# (for example images_report/media/image1.png).
+# Move every file straight into the images folder.
+for root, _dirs, files in os.walk(images_dir):
+    if root == images_dir:
+        continue
+    for filename in files:
+        source = os.path.join(root, filename)
+        target = os.path.join(images_dir, filename)
+        stem, ext = os.path.splitext(filename)
+        counter = 1
+        while os.path.exists(target):
+            target = os.path.join(images_dir, f"{stem}_{counter}{ext}")
+            counter += 1
+        shutil.move(source, target)
+        moves[os.path.relpath(source, base_dir)] = os.path.relpath(target, base_dir)
+
+for root, _dirs, _files in os.walk(images_dir, topdown=False):
+    if root != images_dir and not os.listdir(root):
+        os.rmdir(root)
+
+if moves:
+    with open(markdown_file, encoding="utf-8") as f:
+        text = f.read()
+
+    for old, new in moves.items():
+        text = text.replace(old, new)
+        text = text.replace(quote(old, safe="/"), quote(new, safe="/"))
+
+    with open(markdown_file, "w", encoding="utf-8") as f:
+        f.write(text)
+
+count = len(os.listdir(images_dir))
+
+if count == 0:
+    os.rmdir(images_dir)
+
+print(count)
+PYTHON
+}
+
 convert_document() {
 
     local file="$1"
     local output="$2"
 
-    pandoc "$file" \
-        --to=gfm \
-        --wrap=none \
-        -o "$output"
+    local directory
+    local name
+    local images_dir
+    local source
+    local image_count
+
+    directory="$(dirname "$output")"
+    name="$(basename "${output%.md}")"
+    images_dir="images_$name"
+    source="$(absolute_path "$file")"
+
+    # Images from a previous run are replaced, just like the .md file.
+    rm -rf "$directory/$images_dir"
+
+    # Run inside the output folder so image links are relative to the
+    # Markdown file and keep working when the folder is moved.
+    if ! (
+        cd "$directory" &&
+        pandoc "$source" \
+            --to=gfm \
+            --wrap=none \
+            --extract-media="$images_dir" \
+            -o "$name.md"
+    ); then
+        return 1
+    fi
+
+    image_count="$(flatten_images "$output" "$directory/$images_dir")"
+
+    if [ "${image_count:-0}" -gt 0 ]; then
+        echo "Images:"
+        echo "  $image_count saved to $directory/$images_dir"
+    fi
 }
 
 convert_pdf() {
