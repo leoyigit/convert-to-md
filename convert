@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+
+# ============================================================
+# Convert to Markdown
+# ============================================================
+# Convert documents and folders into Markdown files.
+#
+# Developed by Leo Yigit Ekiz
+# GitHub: https://github.com/leoyigit
+#
+# License: MIT
+# ============================================================
+
+set -u
+
+VERSION="1.0.0"
+
+SUPPORTED_EXTENSIONS=(
+  "docx"
+  "odt"
+  "rtf"
+  "html"
+  "htm"
+  "epub"
+  "pdf"
+  "txt"
+  "csv"
+  "tsv"
+  "xlsx"
+  "xls"
+  "json"
+)
+
+print_header() {
+    echo ""
+    echo "Convert to Markdown v$VERSION"
+    echo "Developed by Leo Yigit Ekiz"
+    echo "https://github.com/leoyigit"
+    echo ""
+}
+
+show_help() {
+    print_header
+
+    cat <<EOF
+Usage:
+
+  convert
+  convert <file>
+  convert <folder>
+
+Examples:
+
+  convert
+  convert ~/Desktop/document.docx
+  convert ~/Desktop/project-folder
+
+Supported formats:
+
+  DOCX
+  ODT
+  RTF
+  HTML
+  EPUB
+  PDF
+  TXT
+  CSV
+  TSV
+  XLSX
+  XLS
+  JSON
+
+The generated .md file is saved next to the original file.
+
+If a folder is provided, all supported files inside that folder
+and its subfolders will be converted.
+
+Options:
+
+  -h, --help       Show help
+  -v, --version    Show version
+
+EOF
+}
+
+check_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "Missing dependency: $1"
+        return 1
+    fi
+}
+
+check_dependencies() {
+
+    local missing=0
+
+    if ! command -v pandoc >/dev/null 2>&1; then
+        echo "Missing dependency: pandoc"
+        missing=1
+    fi
+
+    if ! command -v pdftotext >/dev/null 2>&1; then
+        echo "Missing dependency: pdftotext"
+        missing=1
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Missing dependency: python3"
+        missing=1
+    fi
+
+    if [ "$missing" -eq 1 ]; then
+        echo ""
+        echo "Please install the required dependencies."
+        echo "See the README:"
+        echo "https://github.com/leoyigit/convert-to-md"
+        echo ""
+        exit 1
+    fi
+}
+
+normalize_input() {
+
+    local input="$1"
+
+    input="${input%\"}"
+    input="${input#\"}"
+
+    input="${input%\'}"
+    input="${input#\'}"
+
+    printf '%s' "$input"
+}
+
+convert_document() {
+
+    local file="$1"
+    local output="$2"
+
+    pandoc "$file" \
+        --to=gfm \
+        --wrap=none \
+        -o "$output"
+}
+
+convert_pdf() {
+
+    local file="$1"
+    local output="$2"
+    local temp_file
+
+    temp_file="$(mktemp)"
+
+    if ! pdftotext -layout "$file" "$temp_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    pandoc "$temp_file" \
+        --from=plain \
+        --to=gfm \
+        --wrap=none \
+        -o "$output"
+
+    rm -f "$temp_file"
+}
+
+convert_csv() {
+
+    local file="$1"
+    local output="$2"
+    local extension="$3"
+
+    python3 - "$file" "$output" "$extension" <<'PYTHON'
+import sys
+
+try:
+    import pandas as pd
+except ImportError:
+    print("Python package 'pandas' is required.")
+    print("Install it with:")
+    print("python3 -m pip install pandas tabulate")
+    sys.exit(1)
+
+input_file = sys.argv[1]
+output_file = sys.argv[2]
+extension = sys.argv[3]
+
+separator = "\t" if extension == "tsv" else ","
+
+try:
+    df = pd.read_csv(input_file, sep=separator)
+except UnicodeDecodeError:
+    df = pd.read_csv(
+        input_file,
+        sep=separator,
+        encoding="latin1"
+    )
+
+with open(output_file, "w", encoding="utf-8") as f:
+    f.write(df.to_markdown(index=False))
+    f.write("\n")
+PYTHON
+}
+
+convert_excel() {
+
+    local file="$1"
+    local output="$2"
+
+    python3 - "$file" "$output" <<'PYTHON'
+import sys
+
+try:
+    import pandas as pd
+except ImportError:
+    print("Python package 'pandas' is required.")
+    print("Install it with:")
+    print("python3 -m pip install pandas openpyxl xlrd tabulate")
+    sys.exit(1)
+
+input_file = sys.argv[1]
+output_file = sys.argv[2]
+
+try:
+    workbook = pd.ExcelFile(input_file)
+except Exception as exc:
+    print(f"Could not open spreadsheet: {exc}")
+    sys.exit(1)
+
+with open(output_file, "w", encoding="utf-8") as f:
+
+    for index, sheet_name in enumerate(workbook.sheet_names):
+
+        df = pd.read_excel(
+            input_file,
+            sheet_name=sheet_name
+        )
+
+        f.write(f"# {sheet_name}\n\n")
+
+        if df.empty:
+            f.write("_Empty sheet_\n")
+        else:
+            f.write(df.to_markdown(index=False))
+
+        f.write("\n\n")
+
+        if index < len(workbook.sheet_names) - 1:
+            f.write("---\n\n")
+PYTHON
+}
+
+convert_json() {
+
+    local file="$1"
+    local output="$2"
+
+    {
+        echo '```json'
+        cat "$file"
+        echo ""
+        echo '```'
+    } > "$output"
+}
+
+convert_file() {
+
+    local file="$1"
+
+    local directory
+    local filename
+    local name
+    local extension
+    local output
+
+    directory="$(dirname "$file")"
+    filename="$(basename "$file")"
+
+    if [[ "$filename" != *.* ]]; then
+        echo "Skipping file without extension:"
+        echo "  $file"
+        return
+    fi
+
+    name="${filename%.*}"
+    extension="${filename##*.}"
+
+    extension="$(printf '%s' "$extension" | tr '[:upper:]' '[:lower:]')"
+
+    output="$directory/$name.md"
+
+    echo ""
+    echo "Converting:"
+    echo "  $file"
+
+    case "$extension" in
+
+        docx|odt|rtf|html|htm|epub)
+
+            if convert_document "$file" "$output"; then
+                echo "Created:"
+                echo "  $output"
+            else
+                echo "Failed:"
+                echo "  $file"
+            fi
+            ;;
+
+        pdf)
+
+            if convert_pdf "$file" "$output"; then
+                echo "Created:"
+                echo "  $output"
+            else
+                echo "Failed:"
+                echo "  $file"
+            fi
+            ;;
+
+        txt)
+
+            cp "$file" "$output"
+
+            echo "Created:"
+            echo "  $output"
+            ;;
+
+        csv|tsv)
+
+            if convert_csv "$file" "$output" "$extension"; then
+                echo "Created:"
+                echo "  $output"
+            else
+                echo "Failed:"
+                echo "  $file"
+            fi
+            ;;
+
+        xlsx|xls)
+
+            if convert_excel "$file" "$output"; then
+                echo "Created:"
+                echo "  $output"
+            else
+                echo "Failed:"
+                echo "  $file"
+            fi
+            ;;
+
+        json)
+
+            convert_json "$file" "$output"
+
+            echo "Created:"
+            echo "  $output"
+            ;;
+
+        md|markdown)
+
+            echo "Skipping existing Markdown file."
+            ;;
+
+        *)
+
+            echo "Unsupported file type: .$extension"
+            ;;
+
+    esac
+}
+
+convert_folder() {
+
+    local folder="$1"
+    local count=0
+
+    echo ""
+    echo "Scanning folder:"
+    echo "  $folder"
+    echo ""
+
+    while IFS= read -r -d '' file; do
+
+        convert_file "$file"
+
+        count=$((count + 1))
+
+    done < <(
+        find "$folder" -type f \
+        \( \
+            -iname "*.docx" \
+            -o -iname "*.odt" \
+            -o -iname "*.rtf" \
+            -o -iname "*.html" \
+            -o -iname "*.htm" \
+            -o -iname "*.epub" \
+            -o -iname "*.pdf" \
+            -o -iname "*.txt" \
+            -o -iname "*.csv" \
+            -o -iname "*.tsv" \
+            -o -iname "*.xlsx" \
+            -o -iname "*.xls" \
+            -o -iname "*.json" \
+        \) \
+        -print0
+    )
+
+    echo ""
+    echo "----------------------------------------"
+    echo "Finished."
+    echo "$count supported file(s) found."
+    echo ""
+}
+
+main() {
+
+    case "${1:-}" in
+
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+
+        -v|--version)
+            echo "convert $VERSION"
+            exit 0
+            ;;
+
+    esac
+
+    check_dependencies
+
+    print_header
+
+    local input
+
+    if [ $# -eq 0 ]; then
+
+        echo "Drag a file or folder into this Terminal window."
+        echo "Then press Enter:"
+        echo ""
+
+        IFS= read -r input
+
+    else
+
+        input="$1"
+
+    fi
+
+    input="$(normalize_input "$input")"
+
+    if [ ! -e "$input" ]; then
+
+        echo ""
+        echo "File or folder not found:"
+        echo "  $input"
+        echo ""
+
+        exit 1
+    fi
+
+    if [ -f "$input" ]; then
+
+        convert_file "$input"
+
+    elif [ -d "$input" ]; then
+
+        convert_folder "$input"
+
+    else
+
+        echo "Unsupported input."
+        exit 1
+
+    fi
+}
+
+main "$@"
