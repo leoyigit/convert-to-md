@@ -13,7 +13,15 @@
 
 set -u
 
-VERSION="1.1.0"
+VERSION="1.2.0"
+
+REPO_URL="https://github.com/leoyigit/convert-to-md"
+RAW_SCRIPT_URL="https://raw.githubusercontent.com/leoyigit/convert-to-md/main/convert"
+
+# Where the result of the daily update check is remembered.
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/convert-to-md"
+CACHE_FILE="$CACHE_DIR/latest_version"
+UPDATE_CHECK_INTERVAL=86400
 
 SUPPORTED_EXTENSIONS=(
   "docx"
@@ -81,8 +89,14 @@ and its subfolders will be converted.
 
 Options:
 
-  -h, --help       Show help
-  -v, --version    Show version
+  -h, --help           Show help
+  -v, --version        Show version
+  -u, --update         Update to the latest version from GitHub
+      --check-update   Check whether a newer version is available
+
+Once a day the tool quietly checks GitHub for a newer version and
+prints a notice if one exists. Set CONVERT_NO_UPDATE_CHECK=1 to
+disable this.
 
 EOF
 }
@@ -123,6 +137,215 @@ check_dependencies() {
     fi
 }
 
+# Absolute path of a file, without requiring realpath/readlink -f.
+absolute_path() {
+
+    local path="$1"
+
+    printf '%s/%s' "$(cd "$(dirname "$path")" && pwd)" "$(basename "$path")"
+}
+
+# ------------------------------------------------------------
+# Updates
+# ------------------------------------------------------------
+
+# Returns 0 when version $1 is newer than version $2.
+version_gt() {
+
+    local IFS=.
+    local left=($1)
+    local right=($2)
+    local i
+
+    for i in 0 1 2; do
+
+        local a="${left[i]:-0}"
+        local b="${right[i]:-0}"
+
+        if (( 10#$a > 10#$b )); then
+            return 0
+        fi
+
+        if (( 10#$a < 10#$b )); then
+            return 1
+        fi
+
+    done
+
+    return 1
+}
+
+# Reads the VERSION line out of a copy of this script.
+version_in_file() {
+
+    sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$1" | head -n 1
+}
+
+# Downloads the published script to $1. Fails silently.
+download_latest() {
+
+    local target="$1"
+    local timeout="${2:-30}"
+
+    command -v curl >/dev/null 2>&1 || return 1
+
+    curl -fsSL --max-time "$timeout" "$RAW_SCRIPT_URL" -o "$target"
+}
+
+remember_latest_version() {
+
+    mkdir -p "$CACHE_DIR" 2>/dev/null || return
+
+    printf '%s\n' "$1" > "$CACHE_FILE.tmp" 2>/dev/null &&
+        mv -f "$CACHE_FILE.tmp" "$CACHE_FILE" 2>/dev/null
+}
+
+# Refreshes the cached latest version at most once a day.
+# Runs in the background so the tool never waits on the network.
+refresh_update_cache() {
+
+    [ -n "${CONVERT_NO_UPDATE_CHECK:-}" ] && return
+
+    command -v curl >/dev/null 2>&1 || return
+
+    mkdir -p "$CACHE_DIR" 2>/dev/null || return
+
+    local now
+    local checked=0
+
+    now="$(date +%s)"
+
+    if [ -f "$CACHE_FILE" ]; then
+        checked="$(stat -f %m "$CACHE_FILE" 2>/dev/null || stat -c %Y "$CACHE_FILE" 2>/dev/null || echo 0)"
+    fi
+
+    if (( now - checked < UPDATE_CHECK_INTERVAL )); then
+        return
+    fi
+
+    (
+        temp="$(mktemp)"
+
+        if download_latest "$temp" 5; then
+            latest="$(version_in_file "$temp")"
+            if [ -n "$latest" ]; then
+                remember_latest_version "$latest"
+            fi
+        fi
+
+        # Even when offline, wait a day before trying again.
+        touch "$CACHE_FILE" 2>/dev/null
+        rm -f "$temp"
+    ) >/dev/null 2>&1 &
+
+    disown 2>/dev/null || true
+}
+
+# Prints a notice when the cached latest version is newer than this one.
+notify_if_update_available() {
+
+    [ -n "${CONVERT_NO_UPDATE_CHECK:-}" ] && return
+
+    [ -s "$CACHE_FILE" ] || return
+
+    local latest
+
+    latest="$(head -n 1 "$CACHE_FILE")"
+
+    if version_gt "$latest" "$VERSION"; then
+        echo "A new version is available: $latest (you have $VERSION)"
+        echo "Update with:"
+        echo ""
+        echo "  convert --update"
+        echo ""
+    fi
+}
+
+check_update() {
+
+    local temp
+    local latest
+
+    temp="$(mktemp)"
+
+    echo "Checking for updates..."
+
+    if ! download_latest "$temp"; then
+        rm -f "$temp"
+        echo "Could not reach GitHub. Check your internet connection."
+        return 1
+    fi
+
+    latest="$(version_in_file "$temp")"
+    rm -f "$temp"
+
+    if [ -z "$latest" ]; then
+        echo "Could not read the published version."
+        return 1
+    fi
+
+    remember_latest_version "$latest"
+
+    if version_gt "$latest" "$VERSION"; then
+        echo "A new version is available: $latest (you have $VERSION)"
+        echo "Update with:"
+        echo ""
+        echo "  convert --update"
+        echo ""
+    else
+        echo "You have the latest version ($VERSION)."
+    fi
+}
+
+update_self() {
+
+    local target
+    local temp
+    local latest
+
+    target="$(absolute_path "$0")"
+    temp="$(mktemp)"
+
+    echo "Checking for updates..."
+
+    if ! download_latest "$temp"; then
+        rm -f "$temp"
+        echo "Could not reach GitHub. Check your internet connection."
+        return 1
+    fi
+
+    latest="$(version_in_file "$temp")"
+
+    if [ -z "$latest" ] || ! head -n 1 "$temp" | grep -q '^#!' || ! bash -n "$temp" 2>/dev/null; then
+        rm -f "$temp"
+        echo "The downloaded file does not look like a valid convert script."
+        echo "Nothing was changed."
+        return 1
+    fi
+
+    remember_latest_version "$latest"
+
+    if ! version_gt "$latest" "$VERSION"; then
+        rm -f "$temp"
+        echo "You already have the latest version ($VERSION)."
+        return 0
+    fi
+
+    if ! cp "$temp" "$target" 2>/dev/null; then
+        rm -f "$temp"
+        echo "Could not write to:"
+        echo "  $target"
+        echo "Check the file permissions and try again."
+        return 1
+    fi
+
+    chmod +x "$target"
+    rm -f "$temp"
+
+    echo "Updated $VERSION -> $latest"
+    echo "  $target"
+}
+
 normalize_input() {
 
     local input="$1"
@@ -134,14 +357,6 @@ normalize_input() {
     input="${input#\'}"
 
     printf '%s' "$input"
-}
-
-# Absolute path of a file, without requiring realpath/readlink -f.
-absolute_path() {
-
-    local path="$1"
-
-    printf '%s/%s' "$(cd "$(dirname "$path")" && pwd)" "$(basename "$path")"
 }
 
 # Move extracted images to the top of the images folder and fix the
@@ -528,7 +743,20 @@ main() {
 
         -v|--version)
             echo "convert $VERSION"
+            notify_if_update_available
             exit 0
+            ;;
+
+        -u|--update)
+            print_header
+            update_self
+            exit $?
+            ;;
+
+        --check-update)
+            print_header
+            check_update
+            exit $?
             ;;
 
     esac
@@ -536,6 +764,9 @@ main() {
     check_dependencies
 
     print_header
+
+    refresh_update_cache
+    notify_if_update_available
 
     local input
 

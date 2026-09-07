@@ -47,6 +47,8 @@ The tool creates `.md` files next to the originals.
 - Supports plain text
 - Converts every Excel sheet into its own Markdown section
 - Works from anywhere in the terminal after installation
+- Double-click installer for macOS
+- Built-in `convert --update` command and a daily new-version notice
 - Simple interactive drag-and-drop workflow
 - Open source under the MIT License
 
@@ -74,7 +76,18 @@ The tool creates `.md` files next to the originals.
 
 ## Installation
 
-### macOS
+### macOS, one click
+
+1. Download the project as a ZIP from GitHub (green **Code** button, then **Download ZIP**) and unzip it, or clone it with git.
+2. Open the folder and double-click **`Install.command`**.
+
+A Terminal window opens, offers to install any missing dependencies with Homebrew and pip, and installs the `convert` command.
+
+If macOS says the file cannot be opened because it is from an unidentified developer, right-click `Install.command`, choose **Open**, and confirm. This is only needed the first time.
+
+To remove the tool later, double-click **`Uninstall.command`**.
+
+### macOS, terminal
 
 Install the required system dependencies:
 
@@ -117,6 +130,43 @@ convert
 ```
 
 from anywhere.
+
+---
+
+## Updating
+
+Update from the terminal at any time:
+
+```bash
+convert --update
+```
+
+This downloads the latest version from GitHub and replaces the installed command. Nothing else on your system is touched.
+
+To only check whether a newer version exists:
+
+```bash
+convert --check-update
+```
+
+### New-version notice
+
+Once a day, when you run `convert`, it quietly asks GitHub for the latest version number in the background. The check never delays the conversion. If a newer version exists you will see:
+
+```text
+A new version is available: 1.3.0 (you have 1.2.0)
+Update with:
+
+  convert --update
+```
+
+To turn the check off, add this line to your `~/.zshrc`:
+
+```bash
+export CONVERT_NO_UPDATE_CHECK=1
+```
+
+If you installed with `git clone`, `git pull` followed by `./install.sh` works as well.
 
 ---
 
@@ -325,6 +375,18 @@ Show version:
 convert --version
 ```
 
+Update to the latest version:
+
+```bash
+convert --update
+```
+
+Check for a newer version without installing it:
+
+```bash
+convert --check-update
+```
+
 ---
 
 ## Project structure
@@ -332,6 +394,8 @@ convert --version
 ```text
 convert-to-md/
 ├── convert
+├── Install.command
+├── Uninstall.command
 ├── install.sh
 ├── uninstall.sh
 ├── README.md
@@ -342,6 +406,10 @@ convert-to-md/
 ### `convert`
 
 The main command-line utility.
+
+### `Install.command` and `Uninstall.command`
+
+Double-click installers for macOS. They open Terminal and run the scripts below.
 
 ### `install.sh`
 
@@ -376,7 +444,7 @@ MIT open-source license.
 
 ## Uninstall
 
-From the repository directory:
+Double-click `Uninstall.command`, or from the repository directory:
 
 ```bash
 chmod +x uninstall.sh
@@ -468,7 +536,6 @@ Possible future improvements:
 - Improved error reporting
 - Optional recursive/non-recursive folder mode
 - Homebrew installation
-- Automatic dependency installation
 - Additional file formats
 
 ---
