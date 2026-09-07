@@ -13,7 +13,7 @@
 
 set -u
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 REPO_URL="https://github.com/leoyigit/convert-to-md"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/leoyigit/convert-to-md/main/convert"
@@ -349,12 +349,27 @@ update_self() {
 normalize_input() {
 
     local input="$1"
+    local unescaped
+
+    # Finder adds a trailing space after a dragged path.
+    input="${input#"${input%%[![:space:]]*}"}"
+    input="${input%"${input##*[![:space:]]}"}"
 
     input="${input%\"}"
     input="${input#\"}"
 
     input="${input%\'}"
     input="${input#\'}"
+
+    # Dragged paths arrive shell-escaped, for example "My\ File.docx".
+    # Only unescape when the literal path does not exist, so a real
+    # backslash in a filename still works.
+    if [ ! -e "$input" ] && [[ "$input" == *\\* ]]; then
+        unescaped="$(printf '%s' "$input" | sed 's/\\\(.\)/\1/g')"
+        if [ -e "$unescaped" ]; then
+            input="$unescaped"
+        fi
+    fi
 
     printf '%s' "$input"
 }
