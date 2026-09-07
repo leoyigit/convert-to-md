@@ -13,10 +13,12 @@
 
 set -u
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 
 REPO_URL="https://github.com/leoyigit/convert-to-md"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/leoyigit/convert-to-md/main/convert"
+# The API is not cached, so it sees a new release immediately.
+API_SCRIPT_URL="https://api.github.com/repos/leoyigit/convert-to-md/contents/convert"
 
 # Where the result of the daily update check is remembered.
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/convert-to-md"
@@ -189,6 +191,11 @@ download_latest() {
 
     command -v curl >/dev/null 2>&1 || return 1
 
+    # The API serves the latest commit right away. The raw URL is a
+    # fallback for when the API rate limit is hit.
+    curl -fsSL --max-time "$timeout" \
+        -H "Accept: application/vnd.github.raw" \
+        "$API_SCRIPT_URL" -o "$target" 2>/dev/null ||
     curl -fsSL --max-time "$timeout" "$RAW_SCRIPT_URL" -o "$target"
 }
 
