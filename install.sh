@@ -35,6 +35,48 @@ echo "Developed by Leo Yigit Ekiz"
 echo "https://github.com/leoyigit"
 echo ""
 
+echo "Checking dependencies..."
+
+BREW_BIN=""
+
+if command -v brew >/dev/null 2>&1; then
+    BREW_BIN="$(command -v brew)"
+else
+    if [ "$(uname -m)" = "arm64" ]; then
+        BREW_BIN="/opt/homebrew/bin/brew"
+    else
+        BREW_BIN="/usr/local/bin/brew"
+    fi
+
+    if [ ! -x "$BREW_BIN" ]; then
+        echo "Homebrew is not installed. Installing it now..."
+        NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    fi
+
+    if [ ! -x "$BREW_BIN" ]; then
+        echo "Homebrew installation did not complete."
+        exit 1
+    fi
+
+    eval "$("$BREW_BIN" shellenv)"
+fi
+
+missing=()
+
+command -v pandoc >/dev/null 2>&1 || missing+=("pandoc")
+command -v pdftotext >/dev/null 2>&1 || missing+=("poppler")
+command -v python3 >/dev/null 2>&1 || missing+=("python")
+
+if [ "${#missing[@]}" -gt 0 ]; then
+    echo "Installing Homebrew dependencies: ${missing[*]}"
+    "$BREW_BIN" install "${missing[@]}"
+fi
+
+if ! python3 -c "import pandas, openpyxl, xlrd, tabulate" >/dev/null 2>&1; then
+    echo "Installing Python dependencies..."
+    python3 -m pip install --user pandas openpyxl xlrd tabulate
+fi
+
 echo "Installing..."
 
 mkdir -p "$INSTALL_DIR"

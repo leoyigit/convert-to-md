@@ -92,10 +92,12 @@ To remove the tool later, double-click **`Uninstall.command`**.
 To install directly from the terminal without downloading a ZIP:
 
 ```bash
-brew install pandoc poppler
-python3 -m pip install --user pandas openpyxl xlrd tabulate
 curl -fsSL https://raw.githubusercontent.com/leoyigit/convert-to-md/main/install.sh | bash
 ```
+
+The installer automatically installs Homebrew if needed, then installs the
+required system and Python packages before installing the `convert` command.
+macOS may ask for your administrator password while installing Homebrew.
 
 Open a new Terminal window, then run `convert` from anywhere.
 
