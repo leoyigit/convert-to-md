@@ -13,7 +13,7 @@
 
 set -u
 
-VERSION="1.2.2"
+VERSION="1.2.3"
 
 REPO_URL="https://github.com/leoyigit/convert-to-md"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/leoyigit/convert-to-md/main/convert"
@@ -498,11 +498,58 @@ convert_pdf() {
         return 1
     fi
 
-    pandoc "$temp_file" \
-        --from=plain \
-        --to=gfm \
-        --wrap=none \
-        -o "$output"
+    # The extracted text is already readable as Markdown. Pandoc has
+    # no plain-text reader, so tidy the text up directly instead.
+    if ! python3 - "$temp_file" "$output" <<'PYTHON'
+import re
+import sys
+
+input_file = sys.argv[1]
+output_file = sys.argv[2]
+
+with open(input_file, encoding="utf-8", errors="replace") as f:
+    text = f.read()
+
+pages = []
+
+# pdftotext separates pages with a form feed.
+for page in text.split("\f"):
+    lines = [line.rstrip() for line in page.splitlines()]
+
+    # Drop the common indentation so centred or indented text is
+    # not rendered as a code block.
+    indents = [len(l) - len(l.lstrip()) for l in lines if l.strip()]
+    if indents:
+        indent = min(indents)
+        lines = [l[indent:] if l.strip() else "" for l in lines]
+
+    # A lone indented line between blank lines is usually a centred
+    # heading. Outdent it so it is not rendered as a code block.
+    for i, line in enumerate(lines):
+        above = i == 0 or not lines[i - 1].strip()
+        below = i == len(lines) - 1 or not lines[i + 1].strip()
+        if line.strip() and above and below:
+            lines[i] = line.strip()
+
+    page_text = "\n".join(lines).strip("\n")
+    page_text = re.sub(r"\n{3,}", "\n\n", page_text)
+
+    if page_text:
+        pages.append(page_text)
+
+if not pages:
+    print("No text found in this PDF.")
+    print("It is probably a scanned document without a text layer.")
+    sys.exit(1)
+
+with open(output_file, "w", encoding="utf-8") as f:
+    f.write("\n\n---\n\n".join(pages))
+    f.write("\n")
+PYTHON
+    then
+        rm -f "$temp_file"
+        return 1
+    fi
 
     rm -f "$temp_file"
 }
