@@ -64,7 +64,6 @@ fi
 missing=()
 
 command -v pandoc >/dev/null 2>&1 || missing+=("pandoc")
-command -v pdftotext >/dev/null 2>&1 || missing+=("poppler")
 command -v python3 >/dev/null 2>&1 || missing+=("python")
 
 if [ "${#missing[@]}" -gt 0 ]; then
@@ -72,9 +71,13 @@ if [ "${#missing[@]}" -gt 0 ]; then
     "$BREW_BIN" install "${missing[@]}"
 fi
 
-if ! python3 -c "import pandas, openpyxl, xlrd, tabulate" >/dev/null 2>&1; then
+PYTHON_PACKAGES=(pandas openpyxl xlrd tabulate pymupdf)
+
+if ! python3 -c "import pandas, openpyxl, xlrd, tabulate, pymupdf" >/dev/null 2>&1; then
     echo "Installing Python dependencies..."
-    python3 -m pip install --user pandas openpyxl xlrd tabulate
+    # Newer Homebrew Pythons refuse plain pip installs (PEP 668).
+    python3 -m pip install --user "${PYTHON_PACKAGES[@]}" ||
+        python3 -m pip install --user --break-system-packages "${PYTHON_PACKAGES[@]}"
 fi
 
 echo "Installing..."

@@ -13,7 +13,7 @@
 
 set -u
 
-VERSION="1.2.3"
+VERSION="1.3.0"
 
 REPO_URL="https://github.com/leoyigit/convert-to-md"
 RAW_SCRIPT_URL="https://raw.githubusercontent.com/leoyigit/convert-to-md/main/convert"
@@ -82,9 +82,11 @@ Supported formats:
 
 The generated .md file is saved next to the original file.
 
-Images embedded in DOCX, ODT, RTF and EPUB files are extracted into
-an images_<name> folder next to the .md file, and the Markdown links
-point to them.
+Images embedded in DOCX, ODT, RTF, EPUB and PDF files are extracted
+into an images_<name> folder next to the .md file, and the Markdown
+links point to them. PDF pages keep their headings, columns, lists,
+tables and graphics; scanned PDFs are read with OCR when Tesseract
+is installed.
 
 If a folder is provided, all supported files inside that folder
 and its subfolders will be converted.
@@ -116,11 +118,6 @@ check_dependencies() {
 
     if ! command -v pandoc >/dev/null 2>&1; then
         echo "Missing dependency: pandoc"
-        missing=1
-    fi
-
-    if ! command -v pdftotext >/dev/null 2>&1; then
-        echo "Missing dependency: pdftotext"
         missing=1
     fi
 
@@ -489,7 +486,1076 @@ convert_pdf() {
 
     local file="$1"
     local output="$2"
+
+    local directory
+    local name
+    local images_dir
+    local messages
+    local errors
+    local status
+    local line
+    local pictures=0
+
+    directory="$(dirname "$output")"
+    name="$(basename "${output%.md}")"
+    images_dir="images_$name"
+    messages="$(mktemp)"
+    errors="$(mktemp)"
+
+    # Pictures from a previous run are replaced, just like the .md file.
+    rm -rf "$directory/$images_dir"
+
+    # PyMuPDF reads the page layout: headings, columns, lists, tables,
+    # embedded images and vector graphics. Exit code 2 means the package
+    # is not installed, and pdftotext then gives plain text instead.
+    python3 - "$file" "$output" "$images_dir" >"$messages" 2>"$errors" <<'PYTHON'
+import hashlib
+import os
+import re
+import sys
+import xml.etree.ElementTree as ET
+from collections import Counter, defaultdict
+
+try:
+    import pymupdf
+except ImportError:
+    try:
+        import fitz as pymupdf
+    except ImportError:
+        sys.exit(2)
+
+input_file = sys.argv[1]
+output_file = sys.argv[2]
+images_dir_name = sys.argv[3]
+
+output_dir = os.path.dirname(os.path.abspath(output_file))
+images_dir = os.path.join(output_dir, images_dir_name)
+
+# Pictures placed smaller than this on the page are decoration.
+MIN_IMAGE_PT = 24
+MIN_ART_PT = 40
+# Longest side of a saved picture, in pixels.
+MAX_PIXELS_JPEG = 2000
+MAX_PIXELS_PNG = 1600
+ART_DPI = 144
+PAGE_DPI = 110
+OCR_DPI = 200
+
+BULLET_RE = re.compile(r"^([•●○◦▪■□‣∙·–—\-\*])\s+(\S.*)$")
+NUMBERED_RE = re.compile(r"^((?:\d{1,3}|[a-zA-Z])[.)])\s+(\S.*)$")
+NUMERIC_RE = re.compile(r"^[\d\W_]+$")
+
+notes = []
+
+
+def area(rect):
+    return max(rect.width, 0) * max(rect.height, 0)
+
+
+def clean_text(text):
+    text = text.replace("\r", " ").replace("\t", " ").replace("\ufeff", "")
+    text = re.sub(r"[\u00a0\u2000-\u200b\u202f\u3000\u2028 ]+", " ", text)
+    return text.strip()
+
+
+def letters(text):
+    return sum(c.isalpha() for c in text)
+
+
+def escape_line_start(text):
+    # Text that would accidentally turn into Markdown structure.
+    if re.match(r"^(#{1,6}\s|>|\d+\.\s|[-+*]\s|---|\*\*\*|===)", text):
+        return "\\" + text
+    return text
+
+
+def merge_markers(text):
+    # "**a** **b**" -> "**a b**", "*a* *b*" -> "*a b*"
+    text = re.sub(r"\*\*(\s*)\*\*", r"\1", text)
+    text = re.sub(r"(?<!\*)\*(\s+)\*(?!\*)", r"\1", text)
+    return text
+
+
+try:
+    doc = pymupdf.open(input_file)
+except Exception as exc:
+    print(f"Could not open PDF: {exc}")
+    sys.exit(1)
+
+if doc.needs_pass:
+    print("This PDF is password protected.")
+    sys.exit(1)
+
+page_count = len(doc)
+
+# ------------------------------------------------------------
+# How to split words
+# ------------------------------------------------------------
+# PyMuPDF guesses a space wherever two letters sit a little apart, so
+# letter-spaced text ("S P O O N F U L") falls apart. When the PDF has
+# real space characters the guessing is not needed.
+
+BASE_FLAGS = (
+    pymupdf.TEXT_PRESERVE_LIGATURES
+    | pymupdf.TEXT_PRESERVE_WHITESPACE
+    | pymupdf.TEXT_MEDIABOX_CLIP
+)
+
+guessed = 0
+real = 0
+for page in doc:
+    guessed += len(page.get_text("text", flags=BASE_FLAGS).split())
+    real += len(page.get_text("text", flags=BASE_FLAGS | pymupdf.TEXT_INHIBIT_SPACES).split())
+
+if guessed and real >= 0.9 * guessed:
+    TEXT_FLAGS = BASE_FLAGS | pymupdf.TEXT_INHIBIT_SPACES
+else:
+    TEXT_FLAGS = BASE_FLAGS
+
+
+# ------------------------------------------------------------
+# Text extraction
+# ------------------------------------------------------------
+# Every page becomes a list of blocks; a block is a list of lines;
+# a line is a dict with bbox, text, markup, size and bold.
+
+def font_is_bold(name):
+    name = name.lower()
+    return "bold" in name or "black" in name or "heavy" in name or "semibold" in name
+
+
+def font_is_italic(name):
+    name = name.lower()
+    return "italic" in name or "oblique" in name
+
+
+def is_bold(span):
+    return bool(span["flags"] & 16) or font_is_bold(span["font"])
+
+
+def is_italic(span):
+    return bool(span["flags"] & 2) or font_is_italic(span["font"])
+
+
+def span_markup(spans):
+    """Join the spans of one line, wrapping bold and italic runs."""
+    parts = []
+    previous_end = None
+    for span in spans:
+        raw = span["text"]
+        core = clean_text(raw)
+        if not core:
+            parts.append(" ")
+            continue
+        # A visible gap between spans is a space even when the PDF has none.
+        if raw[:1].isspace() or (previous_end is not None and span["bbox"][0] - previous_end > span["size"] * 0.15):
+            parts.append(" ")
+        previous_end = span["bbox"][2]
+        bold = is_bold(span)
+        italic = is_italic(span)
+        if bold and italic:
+            core = f"***{core}***"
+        elif bold:
+            core = f"**{core}**"
+        elif italic:
+            core = f"*{core}*"
+        parts.append(core)
+        if raw[-1:].isspace():
+            parts.append(" ")
+    return clean_text(merge_markers("".join(parts)))
+
+
+def make_line(bbox, text, markup, size, bold):
+    return {"bbox": pymupdf.Rect(bbox), "text": text, "markup": markup, "size": size, "bold": bold}
+
+
+def lines_from_dict(page, textpage=None):
+    blocks = []
+    data = page.get_text("dict", flags=TEXT_FLAGS, textpage=textpage)
+    for block in data["blocks"]:
+        if block["type"] != 0:
+            continue
+        lines = []
+        for line in block["lines"]:
+            spans = [s for s in line["spans"] if clean_text(s["text"])]
+            if not spans:
+                continue
+            # Text far apart on one baseline (columns, labels) is split
+            # so each piece keeps its own place on the page.
+            segments = [[spans[0]]]
+            for previous, span in zip(spans, spans[1:]):
+                gap = span["bbox"][0] - previous["bbox"][2]
+                if gap > 1.5 * max(span["size"], previous["size"], 1):
+                    segments.append([span])
+                else:
+                    segments[-1].append(span)
+            for segment in segments:
+                rect = pymupdf.Rect(segment[0]["bbox"])
+                sizes = Counter()
+                for s in segment:
+                    rect |= pymupdf.Rect(s["bbox"])
+                    sizes[round(s["size"], 1)] += len(s["text"].strip())
+                text = clean_text("".join(s["text"] for s in segment))
+                if not text:
+                    continue
+                lines.append(make_line(rect, text, span_markup(segment),
+                                       sizes.most_common(1)[0][0], all(is_bold(s) for s in segment)))
+        if lines:
+            blocks.append(lines)
+    return blocks
+
+
+INVALID_REF_RE = re.compile(r"&#(x[0-9A-Fa-f]+|\d+);")
+INVALID_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def sanitize_xml(text):
+    """Some fonts map glyphs to control codes, which XML does not allow.
+    Between two letters such a glyph is almost always an apostrophe."""
+    def fix(match):
+        ref = match.group(1)
+        code = int(ref[1:], 16) if ref.startswith("x") else int(ref)
+        if code in (9, 10, 13) or 0x20 <= code <= 0xD7FF or 0xE000 <= code <= 0xFFFD or code > 0xFFFF:
+            return match.group(0)
+        return GLYPH_PLACEHOLDER
+    text = INVALID_REF_RE.sub(fix, text)
+    return INVALID_CHAR_RE.sub("", text)
+
+
+GLYPH_PLACEHOLDER = "\ue000"
+
+
+def resolve_placeholders(text):
+    text = re.sub(rf"(?<=\w){GLYPH_PLACEHOLDER}(?=\w)", "’", text)
+    return text.replace(GLYPH_PLACEHOLDER, "")
+
+
+def lines_from_words(page):
+    """Last resort: plain words with their boxes."""
+    groups = defaultdict(lambda: defaultdict(list))
+    for w in page.get_text("words", flags=TEXT_FLAGS):
+        groups[w[5]][w[6]].append(w)
+    blocks = []
+    for block_no in sorted(groups):
+        lines = []
+        for line_no in sorted(groups[block_no]):
+            words = sorted(groups[block_no][line_no], key=lambda w: w[0])
+            rect = pymupdf.Rect(words[0][:4])
+            for w in words[1:]:
+                rect |= pymupdf.Rect(w[:4])
+            text = clean_text(" ".join(w[4] for w in words))
+            if text:
+                lines.append(make_line(rect, text, text, round(rect.height, 1), False))
+        if lines:
+            blocks.append(lines)
+    return blocks
+
+
+def lines_from_xml(page):
+    """Fallback for PDFs where the dict extractor drops text (some Type 3 fonts)."""
+    try:
+        root = ET.fromstring(sanitize_xml(page.get_text("xml", flags=TEXT_FLAGS)))
+    except Exception:
+        return lines_from_words(page)
+    blocks = []
+    for block in root.iter("block"):
+        lines = []
+        for line in block.findall("line"):
+            chars = []
+            for font in line.findall("font"):
+                name = font.get("name", "")
+                try:
+                    size = float(font.get("size", "0"))
+                except ValueError:
+                    size = 0.0
+                for char in font.findall("char"):
+                    c = char.get("c", "")
+                    try:
+                        quad = [float(v) for v in (char.get("quad") or "").split()]
+                        x = float(char.get("x", "0"))
+                        y = float(char.get("y", "0"))
+                    except ValueError:
+                        continue
+                    if len(quad) == 8:
+                        x0, x1 = min(quad[0::2]), max(quad[0::2])
+                        y0, y1 = min(quad[1::2]), max(quad[1::2])
+                    else:
+                        x0 = x1 = x
+                        y0 = y1 = y
+                    chars.append({"c": c, "x0": x0, "x1": x1, "y0": y0, "y1": y1, "y": y, "size": size, "font": name})
+            if not chars:
+                continue
+            segments = [[chars[0]]]
+            for previous, char in zip(chars, chars[1:]):
+                gap = char["x0"] - previous["x1"]
+                if gap > 1.5 * max(char["size"], previous["size"], 1) and previous["c"] != " ":
+                    segments.append([char])
+                else:
+                    segments[-1].append(char)
+            for segment in segments:
+                text = clean_text(resolve_placeholders("".join(ch["c"] for ch in segment)))
+                if not text:
+                    continue
+                sizes = Counter()
+                fonts = set()
+                for ch in segment:
+                    if ch["c"].strip():
+                        sizes[round(ch["size"], 1)] += 1
+                        fonts.add(ch["font"])
+                size = sizes.most_common(1)[0][0] if sizes else round(segment[0]["size"], 1)
+                x0 = min(ch["x0"] for ch in segment)
+                x1 = max(ch["x1"] for ch in segment)
+                y0 = min(ch["y0"] for ch in segment)
+                y1 = max(ch["y1"] for ch in segment)
+                if y1 - y0 < size * 0.3:
+                    # Degenerate glyph boxes: build the box from the baseline.
+                    baseline = max(ch["y"] for ch in segment)
+                    y0, y1 = baseline - size * 0.8, baseline + size * 0.2
+                bold = bool(fonts) and all(font_is_bold(f) for f in fonts)
+                italic = bool(fonts) and all(font_is_italic(f) for f in fonts)
+                markup = text
+                if bold and italic:
+                    markup = f"***{text}***"
+                elif bold:
+                    markup = f"**{text}**"
+                elif italic:
+                    markup = f"*{text}*"
+                lines.append(make_line((x0, y0, x1, y1), text, markup, size, bold))
+        if lines:
+            blocks.append(lines)
+    return blocks
+
+
+def regroup(blocks):
+    """Split blocks whose lines do not sit above each other (side-by-side labels)."""
+    out = []
+    for lines in blocks:
+        current = [lines[0]]
+        for line in lines[1:]:
+            previous = current[-1]
+            overlap = min(previous["bbox"].x1, line["bbox"].x1) - max(previous["bbox"].x0, line["bbox"].x0)
+            if overlap > 0:
+                current.append(line)
+            else:
+                out.append(current)
+                current = [line]
+        out.append(current)
+    return out
+
+
+def find_tessdata():
+    candidates = [
+        os.environ.get("TESSDATA_PREFIX"),
+        "/opt/homebrew/share/tessdata",
+        "/usr/local/share/tessdata",
+        "/usr/share/tessdata",
+        "/usr/share/tesseract-ocr/5/tessdata",
+        "/usr/share/tesseract-ocr/4.00/tessdata",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(os.path.join(path, "eng.traineddata")):
+            return path
+    return None
+
+
+def page_has_scan(page):
+    try:
+        for info in page.get_images(full=True):
+            for rect in page.get_image_rects(info[0]):
+                if area(rect & page.rect) > 0.3 * area(page.rect):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+# Pass 1: decide which extractor the document needs.
+use_xml = False
+for page in doc:
+    if not lines_from_dict(page) and lines_from_xml(page):
+        use_xml = True
+        break
+
+extract = lines_from_xml if use_xml else lines_from_dict
+
+page_blocks = []
+ocr_pages = 0
+tessdata = None
+ocr_checked = False
+
+for page in doc:
+    blocks = extract(page)
+    if not blocks and page_has_scan(page):
+        if not ocr_checked:
+            tessdata = find_tessdata()
+            ocr_checked = True
+        if tessdata:
+            try:
+                textpage = page.get_textpage_ocr(flags=TEXT_FLAGS, language=os.environ.get("CONVERT_OCR_LANG", "eng"),
+                                                 dpi=OCR_DPI, full=True, tessdata=tessdata)
+                blocks = lines_from_dict(page, textpage)
+                if blocks:
+                    ocr_pages += 1
+            except Exception:
+                pass
+    page_blocks.append(regroup(blocks))
+
+if ocr_pages:
+    notes.append(f"{ocr_pages} scanned page(s) were read with OCR.")
+
+# ------------------------------------------------------------
+# Running headers and footers
+# ------------------------------------------------------------
+
+size_chars = Counter()
+for blocks in page_blocks:
+    for lines in blocks:
+        for line in lines:
+            size_chars[line["size"]] += len(line["text"])
+
+body_size = size_chars.most_common(1)[0][0] if size_chars else 10.0
+
+
+def header_key(text):
+    key = re.sub(r"\d+", "#", text.lower())
+    return re.sub(r"\s+", " ", key).strip()
+
+
+def in_margin(line, page):
+    height = page.rect.height
+    y = (line["bbox"].y0 + line["bbox"].y1) / 2
+    return (y < height * 0.12 or y > height * 0.90) and line["size"] <= body_size * 1.3
+
+
+zone_pages = defaultdict(set)
+for page_no, (page, blocks) in enumerate(zip(doc, page_blocks)):
+    for lines in blocks:
+        for line in lines:
+            if in_margin(line, page):
+                zone_pages[header_key(line["text"])].add(page_no)
+
+repeat_threshold = 2 if page_count <= 4 else 3
+running_keys = {k for k, pages in zone_pages.items() if len(pages) >= repeat_threshold}
+
+
+def is_running(line, page):
+    return bool(running_keys) and in_margin(line, page) and header_key(line["text"]) in running_keys
+
+
+# ------------------------------------------------------------
+# Heading levels
+# ------------------------------------------------------------
+# Font sizes clearly above the body text are ranked: the largest size
+# that is used for real words more than once becomes "#", the next
+# "##", and so on down to "####". Rare sizes borrow the level of the
+# closest ranked size.
+
+size_lines = defaultdict(list)
+for page, blocks in zip(doc, page_blocks):
+    for lines in blocks:
+        for line in lines:
+            if not is_running(line, page):
+                size_lines[line["size"]].append(line["text"])
+
+candidate_sizes = sorted((s for s in size_lines if s >= body_size * 1.15), reverse=True)
+ranked = [s for s in candidate_sizes if sum(1 for t in size_lines[s] if letters(t) >= 3) >= 2]
+
+size_level = {}
+level = 0
+previous = None
+for size in ranked:
+    if previous is None or size < previous * 0.9:
+        level += 1
+    size_level[size] = min(level, 4)
+    previous = size
+
+for size in candidate_sizes:
+    if size in size_level:
+        continue
+    if not ranked:
+        size_level[size] = 1
+        continue
+    nearest = min(ranked, key=lambda r: abs(r / size - 1))
+    size_level[size] = size_level[nearest]
+
+
+def heading_level(line):
+    return size_level.get(line["size"], 0)
+
+
+# ------------------------------------------------------------
+# Pictures
+# ------------------------------------------------------------
+
+saved_by_xref = {}
+saved_by_hash = {}
+picture_count = 0
+
+
+def picture_path(page_no, kind, index, ext):
+    return os.path.join(images_dir, f"page{page_no + 1:02d}_{kind}{index}.{ext}")
+
+
+def shrink_to(pix, limit):
+    while max(pix.width, pix.height) > limit:
+        pix.shrink(1)
+    return pix
+
+
+def save_pixmap(pix, path):
+    global picture_count
+    os.makedirs(images_dir, exist_ok=True)
+    if path.endswith(".jpg"):
+        pix.save(path, jpg_quality=85)
+    else:
+        pix.save(path)
+    picture_count += 1
+    return os.path.relpath(path, output_dir)
+
+
+def save_image(xref, page_no, index):
+    if xref in saved_by_xref:
+        return saved_by_xref[xref]
+    result = None
+    try:
+        pix = pymupdf.Pixmap(doc, xref)
+        if pix.width >= 32 and pix.height >= 32:
+            if pix.colorspace is None or pix.n - pix.alpha >= 4:
+                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+            if pix.alpha:
+                pix = pymupdf.Pixmap(pix, 0)
+            info = doc.extract_image(xref) or {}
+            smask = info.get("smask", 0)
+            if smask:
+                try:
+                    mask = pymupdf.Pixmap(doc, smask)
+                    samples = mask.samples
+                    opaque = samples.count(b"\xff") == len(samples)
+                    if not opaque and (mask.width, mask.height) == (pix.width, pix.height):
+                        pix = pymupdf.Pixmap(pix, mask)
+                except Exception:
+                    pass
+            if pix.alpha:
+                ext = "png"
+                shrink_to(pix, MAX_PIXELS_PNG)
+            else:
+                ext = "jpg"
+                shrink_to(pix, MAX_PIXELS_JPEG)
+            digest = hashlib.md5(pix.samples).hexdigest()
+            if digest in saved_by_hash:
+                result = saved_by_hash[digest]
+            else:
+                result = save_pixmap(pix, picture_path(page_no, "image", index, ext))
+                saved_by_hash[digest] = result
+    except Exception:
+        result = None
+    saved_by_xref[xref] = result
+    return result
+
+
+def render_clip(page, rect, page_no, kind, index, dpi):
+    try:
+        pix = page.get_pixmap(clip=rect, dpi=dpi, alpha=False)
+        shrink_to(pix, MAX_PIXELS_JPEG)
+        return save_pixmap(pix, picture_path(page_no, kind, index, "png"))
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------------
+# Tables
+# ------------------------------------------------------------
+
+def find_tables(page):
+    tables = []
+    try:
+        found = page.find_tables()
+    except Exception:
+        return tables
+    for table in found.tables:
+        try:
+            rows = table.extract()
+        except Exception:
+            continue
+        rows = [[clean_text(str(c)) if c is not None else "" for c in row] for row in rows]
+        rows = [row for row in rows if any(row)]
+        if len(rows) < 2 or max(len(r) for r in rows) < 2:
+            continue
+        cells = sum(len(r) for r in rows)
+        filled = sum(1 for r in rows for c in r if c)
+        if filled < cells * 0.4:
+            continue
+        width = max(len(r) for r in rows)
+        rows = [r + [""] * (width - len(r)) for r in rows]
+        lines = ["| " + " | ".join(c.replace("|", "\\|") for c in rows[0]) + " |",
+                 "|" + "---|" * width]
+        for row in rows[1:]:
+            lines.append("| " + " | ".join(c.replace("|", "\\|") for c in row) + " |")
+        tables.append({"bbox": pymupdf.Rect(table.bbox), "markdown": "\n".join(lines)})
+    return tables
+
+
+# ------------------------------------------------------------
+# Reading order
+# ------------------------------------------------------------
+# Recursive cuts: split the page at empty horizontal bands, then each
+# band at empty vertical gaps, and so on. Columns are read one after
+# the other instead of line by line across the page.
+
+def split_by(items, axis, min_gap):
+    if axis == "y":
+        intervals = sorted((i["bbox"].y0, i["bbox"].y1) for i in items)
+    else:
+        intervals = sorted((i["bbox"].x0, i["bbox"].x1) for i in items)
+    segments = [list(intervals[0])]
+    for start, end in intervals[1:]:
+        if start <= segments[-1][1] + min_gap:
+            segments[-1][1] = max(segments[-1][1], end)
+        else:
+            segments.append([start, end])
+    if len(segments) < 2:
+        return None
+    buckets = [[] for _ in segments]
+    for item in items:
+        r = item["bbox"]
+        centre = (r.y0 + r.y1) / 2 if axis == "y" else (r.x0 + r.x1) / 2
+        for idx, (start, end) in enumerate(segments):
+            if start - min_gap <= centre <= end + min_gap:
+                buckets[idx].append(item)
+                break
+        else:
+            buckets[-1].append(item)
+    return [b for b in buckets if b]
+
+
+def widest_cut(parts, axis):
+    """Split the parts in two at their widest empty band.
+    Returns (gap relative to the extent, before, after)."""
+    if axis == "y":
+        spans = [(min(i["bbox"].y0 for i in p), max(i["bbox"].y1 for i in p)) for p in parts]
+    else:
+        spans = [(min(i["bbox"].x0 for i in p), max(i["bbox"].x1 for i in p)) for p in parts]
+    order = sorted(range(len(parts)), key=lambda k: spans[k])
+    best = None
+    for a, b in zip(order, order[1:]):
+        gap = spans[b][0] - spans[a][1]
+        if best is None or gap > best[0]:
+            best = (gap, b)
+    extent = max(max(s[1] for s in spans) - min(s[0] for s in spans), 1)
+    cut = order.index(best[1])
+    before = [i for k in order[:cut] for i in parts[k]]
+    after = [i for k in order[cut:] for i in parts[k]]
+    return best[0] / extent, before, after
+
+
+def group_rows(items):
+    """Short labels that share a baseline ("01" and "Introduction",
+    "Phone:" and a number) are kept together as one row."""
+    n = len(items)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        a = items[i]
+        if a["kind"] != "text":
+            continue
+        for j in range(i + 1, n):
+            b = items[j]
+            if b["kind"] != "text" or (len(a["lines"]) > 1 and len(b["lines"]) > 1):
+                continue
+            ra, rb = a["bbox"], b["bbox"]
+            overlap = min(ra.y1, rb.y1) - max(ra.y0, rb.y0)
+            if overlap < 0.6 * min(ra.height, rb.height):
+                continue
+            gap = max(rb.x0 - ra.x1, ra.x0 - rb.x1)
+            size = max(l["size"] for l in a["lines"] + b["lines"])
+            if gap < 1.5 * size:
+                parent[find(i)] = find(j)
+
+    groups = defaultdict(list)
+    for i in range(n):
+        groups[find(i)].append(items[i])
+    units = []
+    for members in groups.values():
+        if len(members) == 1:
+            units.append(members[0])
+            continue
+        members.sort(key=lambda m: m["bbox"].x0)
+        rect = pymupdf.Rect(members[0]["bbox"])
+        for m in members[1:]:
+            rect |= m["bbox"]
+        units.append({"kind": "row", "bbox": rect, "items": members})
+    return units
+
+
+def reading_order(items, min_gap_y, min_gap_x, depth=0):
+    if len(items) <= 1 or depth > 60:
+        return list(items)
+    # Classic recursive cut: divide at the clearest empty band, either a
+    # horizontal gap between rows or a vertical gutter between columns.
+    # Ties go to rows, so text is read top to bottom by default.
+    best = None
+    for axis in ("y", "x"):
+        parts = split_by(items, axis, min_gap_y if axis == "y" else min_gap_x)
+        if parts and len(parts) > 1:
+            score, before, after = widest_cut(parts, axis)
+            if best is None or score > best[0]:
+                best = (score, before, after)
+    if best:
+        return (reading_order(best[1], min_gap_y, min_gap_x, depth + 1)
+                + reading_order(best[2], min_gap_y, min_gap_x, depth + 1))
+    return sorted(items, key=lambda i: (round(i["bbox"].y0), i["bbox"].x0))
+
+
+# ------------------------------------------------------------
+# Markdown for one text block
+# ------------------------------------------------------------
+
+def block_markdown(lines):
+    out = []
+    runs = []
+    for line in lines:
+        lvl = heading_level(line)
+        if runs and runs[-1][0] == lvl:
+            runs[-1][1].append(line)
+        else:
+            runs.append((lvl, [line]))
+
+    for lvl, run in runs:
+        if lvl:
+            # Wrapped heading lines sit tightly together; anything
+            # further apart is a separate heading.
+            groups = [[run[0]]]
+            for previous, line in zip(run, run[1:]):
+                if line["bbox"].y1 - previous["bbox"].y1 < previous["size"] * 1.6:
+                    groups[-1].append(line)
+                else:
+                    groups.append([line])
+            for group in groups:
+                text = clean_text(" ".join(l["text"] for l in group))
+                if len(text) <= 120 and len(group) <= 3 and (letters(text) >= 3 or NUMERIC_RE.match(text)):
+                    out.append(("heading", lvl, text))
+                elif letters(text) >= 3:
+                    # Large text that is too long for a heading: a pull quote.
+                    out.append(("paragraph", f"**{text}**"))
+                elif len(text) > 1 or text.isdigit():
+                    out.append(("paragraph", escape_line_start(text)))
+            continue
+
+        paragraphs = []
+        current = []
+        previous = None
+        for line in run:
+            bullet = BULLET_RE.match(line["text"]) or NUMBERED_RE.match(line["text"])
+            new_par = False
+            if previous is not None:
+                # Baseline to baseline: more than about two line heights
+                # apart means an empty line in between.
+                if line["bbox"].y1 - previous["bbox"].y1 > previous["size"] * 1.9 or bullet:
+                    new_par = True
+            if new_par and current:
+                paragraphs.append(current)
+                current = []
+            current.append(line)
+            previous = line
+        if current:
+            paragraphs.append(current)
+
+        for par in paragraphs:
+            first = par[0]["text"]
+            bullet = BULLET_RE.match(first) or NUMBERED_RE.match(first)
+            pieces = []
+            for line in par:
+                text = line["markup"]
+                if pieces and pieces[-1].endswith("-") and text[:1].islower():
+                    pieces[-1] = pieces[-1][:-1] + text
+                else:
+                    pieces.append(text)
+            text = clean_text(merge_markers(" ".join(pieces)))
+            if bullet:
+                marker, _ = bullet.groups()
+                stripped = re.sub(r"^\**" + re.escape(marker) + r"\**\s*", "", text)
+                if stripped != text and clean_text(stripped):
+                    body = clean_text(stripped)
+                else:
+                    plain = clean_text(" ".join(l["text"] for l in par))
+                    body = clean_text(plain[len(marker):]) if plain.startswith(marker) else plain
+                if NUMBERED_RE.match(first) and marker[:-1].isdigit():
+                    out.append(("list", f"{marker[:-1]}. {body}"))
+                else:
+                    out.append(("list", f"- {body}"))
+            elif len(text) == 1 and not text.isdigit():
+                # A lone mark such as the "X" of a clear-space diagram.
+                continue
+            elif all(l["bold"] for l in par) and len(text) <= 120:
+                out.append(("paragraph", text if text.startswith("**") else f"**{text}**"))
+            else:
+                out.append(("paragraph", escape_line_start(text)))
+    return out
+
+
+# ------------------------------------------------------------
+# Build the document
+# ------------------------------------------------------------
+
+output = []
+
+
+def emit(kind, *payload):
+    output.append((kind, payload))
+
+
+for page_no, page in enumerate(doc):
+    page_rect = page.rect
+    page_area = area(page_rect)
+
+    tables = find_tables(page)
+    table_rects = [t["bbox"] for t in tables]
+    table_items = [{"bbox": t["bbox"], "kind": "table", "markdown": t["markdown"]} for t in tables]
+
+    # Text, minus running headers and text that lives inside tables.
+    text_blocks = []
+    text_lines = []
+    for lines in page_blocks[page_no]:
+        kept = []
+        for line in lines:
+            if is_running(line, page):
+                continue
+            r = line["bbox"]
+            centre = pymupdf.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+            if any(centre in t for t in table_rects):
+                continue
+            kept.append(line)
+        if kept:
+            text_blocks.append(kept)
+            text_lines.extend(kept)
+
+    # Raster images.
+    image_rects = []
+    image_items = []
+    seen = set()
+    try:
+        image_infos = page.get_images(full=True)
+    except Exception:
+        image_infos = []
+    for info in image_infos:
+        xref = info[0]
+        if xref in seen:
+            continue
+        seen.add(xref)
+        try:
+            rects = [r & page_rect for r in page.get_image_rects(xref)]
+        except Exception:
+            rects = []
+        rects = [r for r in rects if r.width >= MIN_IMAGE_PT and r.height >= MIN_IMAGE_PT]
+        if not rects:
+            continue
+        rect = min(rects, key=lambda r: (round(r.y0), r.x0))
+        path = save_image(xref, page_no, len(image_items) + 1)
+        if path:
+            image_items.append({"bbox": rect, "kind": "picture", "path": path, "label": "image"})
+            image_rects.extend(rects)
+
+    # Vector art: logos, icons, charts, colour swatches.
+    art_items = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        drawings = []
+    if 0 < len(drawings) <= 4000:
+        small = [d for d in drawings if d["rect"].is_valid and not d["rect"].is_infinite
+                 and area(d["rect"]) < 0.8 * page_area]
+        try:
+            clusters = page.cluster_drawings(drawings=small) if small else []
+        except Exception:
+            clusters = []
+        for cluster in clusters:
+            cluster = cluster & page_rect
+            if cluster.width < MIN_ART_PT or cluster.height < MIN_ART_PT:
+                continue
+            cluster_area = area(cluster)
+            if cluster_area > 0.8 * page_area:
+                continue
+            text_area = 0.0
+            words = 0
+            for line in text_lines:
+                inter = line["bbox"] & cluster
+                if not inter.is_empty:
+                    text_area += area(inter)
+                    words += len(line["text"].split())
+            ratio = text_area / cluster_area
+            if ratio > 0.6 or (ratio > 0.3 and words >= 8):
+                continue
+            image_cover = sum(area(r & cluster) for r in image_rects if not (r & cluster).is_empty)
+            if image_cover > 0.5 * cluster_area:
+                continue
+            if any(area(t & cluster) > 0.5 * cluster_area for t in table_rects if not (t & cluster).is_empty):
+                continue
+            path = render_clip(page, cluster, page_no, "art", len(art_items) + 1, ART_DPI)
+            if path:
+                art_items.append({"bbox": cluster, "kind": "picture", "path": path, "label": "graphic"})
+
+    art_rects = [a["bbox"] for a in art_items]
+
+    def inside_art(rect):
+        return any(area(rect & a) >= 0.9 * area(rect) for a in art_rects if not (rect & a).is_empty)
+
+    items = list(table_items)
+
+    # Marks that only make sense inside a rendered graphic ("X", a lone word).
+    for lines in text_blocks:
+        kept = [l for l in lines
+                if not (inside_art(l["bbox"]) and (len(l["text"]) <= 2 or (heading_level(l) and " " not in l["text"])))]
+        if kept:
+            rect = pymupdf.Rect(kept[0]["bbox"])
+            for line in kept[1:]:
+                rect |= line["bbox"]
+            items.append({"bbox": rect, "kind": "text", "lines": kept})
+
+    # Images that sit inside a rendered graphic are already in the picture.
+    for image in image_items:
+        if not inside_art(image["bbox"]):
+            items.append(image)
+    items.extend(art_items)
+
+    if not items and (len(drawings) >= 2 or image_infos):
+        path = render_clip(page, page_rect, page_no, "page", 1, PAGE_DPI)
+        if path:
+            items.append({"bbox": page_rect, "kind": "picture", "path": path, "label": "page"})
+
+    def emit_item(item):
+        if item["kind"] == "text":
+            for entry in block_markdown(item["lines"]):
+                emit(*entry, page_no)
+        elif item["kind"] == "picture":
+            emit("picture", item["path"], f"Page {page_no + 1} {item['label']}", page_no)
+        elif item["kind"] == "table":
+            emit("table", item["markdown"], page_no)
+        elif item["kind"] == "row":
+            for member in item["items"]:
+                emit_item(member)
+
+    for item in reading_order(group_rows(items), max(body_size * 1.2, 6), max(body_size * 0.5, 4)):
+        emit_item(item)
+
+# ------------------------------------------------------------
+# Write Markdown
+# ------------------------------------------------------------
+
+has_text = any(kind in ("heading", "paragraph", "list", "table") for kind, _ in output)
+
+if not has_text and not picture_count:
+    print("Nothing could be extracted from this PDF.")
+    sys.exit(1)
+
+if not has_text:
+    notes.append("No text layer was found, so the pages were saved as images.")
+    if not tessdata:
+        notes.append("Install Tesseract (brew install tesseract) to OCR scanned PDFs.")
+
+# "01 -" followed by "Introduction" becomes one heading.
+merged = []
+skip = False
+for index, (kind, payload) in enumerate(output):
+    if skip:
+        skip = False
+        continue
+    if kind == "heading" and index + 1 < len(output):
+        next_kind, next_payload = output[index + 1]
+        if (next_kind == "heading" and payload[-1] == next_payload[-1]
+                and NUMERIC_RE.match(payload[1]) and not NUMERIC_RE.match(next_payload[1])):
+            number = payload[1].strip(" -–—.:")
+            merged.append(("heading", (next_payload[0], f"{number} {next_payload[1]}".strip())))
+            skip = True
+            continue
+    merged.append((kind, payload))
+
+chunks = []
+previous_kind = None
+for kind, payload in merged:
+    if kind == "heading":
+        lvl, text = payload[0], payload[1]
+        chunks.append(f"{'#' * lvl} {text}")
+    elif kind == "paragraph":
+        chunks.append(payload[0])
+    elif kind == "list":
+        if previous_kind == "list":
+            chunks[-1] += "\n" + payload[0]
+        else:
+            chunks.append(payload[0])
+    elif kind == "picture":
+        path, alt = payload[0], payload[1]
+        chunks.append(f"![{alt}]({path.replace(' ', '%20')})")
+    elif kind == "table":
+        chunks.append(payload[0])
+    previous_kind = kind
+
+with open(output_file, "w", encoding="utf-8") as f:
+    f.write("\n\n".join(chunks))
+    f.write("\n")
+
+print(f"PICTURES {picture_count}")
+for note in notes:
+    print(f"NOTE {note}")
+PYTHON
+    status=$?
+
+    if [ "$status" -eq 2 ]; then
+        rm -f "$messages" "$errors"
+        echo "Python package 'pymupdf' is not installed, so only the text is extracted."
+        echo "For images, headings, lists and tables install it with:"
+        echo "  python3 -m pip install pymupdf"
+        convert_pdf_plain "$file" "$output"
+        return
+    fi
+
+    if [ "$status" -ne 0 ]; then
+        cat "$messages"
+        # The last lines of a Python error say what went wrong.
+        [ -s "$errors" ] && tail -n 3 "$errors"
+        rm -f "$messages" "$errors"
+        return 1
+    fi
+
+    while IFS= read -r line; do
+        case "$line" in
+            "PICTURES "*)
+                pictures="${line#PICTURES }"
+                ;;
+            "NOTE "*)
+                echo "Note: ${line#NOTE }"
+                ;;
+            *)
+                [ -n "$line" ] && echo "$line"
+                ;;
+        esac
+    done < "$messages"
+
+    rm -f "$messages" "$errors"
+
+    if [ "${pictures:-0}" -gt 0 ]; then
+        echo "Images:"
+        echo "  $pictures saved to $directory/$images_dir"
+    fi
+}
+
+# Plain-text fallback for PDFs when PyMuPDF is not available.
+convert_pdf_plain() {
+
+    local file="$1"
+    local output="$2"
     local temp_file
+
+    if ! command -v pdftotext >/dev/null 2>&1; then
+        echo "Missing dependency: pdftotext"
+        echo "Install PyMuPDF (python3 -m pip install pymupdf) or Poppler (brew install poppler)."
+        return 1
+    fi
 
     temp_file="$(mktemp)"
 

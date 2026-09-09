@@ -42,7 +42,8 @@ The tool creates `.md` files next to the originals.
 - Supports Word documents
 - Supports Excel workbooks
 - Supports CSV and TSV files
-- Supports PDFs
+- Supports PDFs, keeping headings, columns, lists, tables, images and graphics
+- Reads scanned PDFs with OCR when Tesseract is installed
 - Supports HTML and EPUB
 - Supports plain text
 - Converts every Excel sheet into its own Markdown section
@@ -64,7 +65,7 @@ The tool creates `.md` files next to the originals.
 | `.html` | Yes | Converted using Pandoc |
 | `.htm` | Yes | Converted using Pandoc |
 | `.epub` | Yes | Converted using Pandoc, images extracted |
-| `.pdf` | Yes | Text extracted with `pdftotext` |
+| `.pdf` | Yes | Layout read with PyMuPDF: headings, columns, lists, tables, images and graphics extracted; scanned pages OCR'd when Tesseract is installed |
 | `.txt` | Yes | Converted directly |
 | `.csv` | Yes | Converted to Markdown tables |
 | `.tsv` | Yes | Converted to Markdown tables |
@@ -110,7 +111,7 @@ For a git-based installation instead, use the steps below.
 Install the required system dependencies:
 
 ```bash
-brew install pandoc poppler
+brew install pandoc
 ```
 
 Check that Python 3 is available:
@@ -122,7 +123,13 @@ python3 --version
 Install the Python dependencies:
 
 ```bash
-python3 -m pip install pandas openpyxl xlrd tabulate
+python3 -m pip install pandas openpyxl xlrd tabulate pymupdf
+```
+
+Optional, for scanned PDFs:
+
+```bash
+brew install tesseract
 ```
 
 Clone the repository:
@@ -185,6 +192,14 @@ export CONVERT_NO_UPDATE_CHECK=1
 ```
 
 If you installed with `git clone`, `git pull` followed by `./install.sh` works as well.
+
+Version 1.3.0 added PyMuPDF for PDF conversion. If you updated with `convert --update` from an older version, install it once:
+
+```bash
+python3 -m pip install pymupdf
+```
+
+Until then PDFs are converted as plain text with `pdftotext`, and `convert` prints a reminder.
 
 ---
 
@@ -268,7 +283,7 @@ Subfolders are scanned too.
 
 ## Images in documents
 
-Images embedded in Word, OpenDocument, RTF and EPUB files are extracted automatically.
+Images embedded in Word, OpenDocument, RTF, EPUB and PDF files are extracted automatically.
 
 They are saved in a folder named `images_<name>` next to the generated Markdown file, and the Markdown links point to that folder with relative paths:
 
@@ -286,7 +301,7 @@ Notes:
 
 - Re-running the conversion replaces the `images_<name>` folder, just like it replaces the `.md` file
 - Documents without images do not get an images folder
-- Images in PDFs are not extracted yet
+- PDF pictures are named after their page, for example `page04_image1.jpg` or `page14_art2.png`
 
 ---
 
@@ -343,21 +358,41 @@ Example output:
 
 ## PDF conversion
 
-PDF files are supported, but PDF is primarily a visual layout format rather than a structured document format.
+PDF is a visual layout format, so the tool reads the layout of every page with PyMuPDF and rebuilds the document from it:
 
-As a result, conversion may not perfectly preserve:
+- Headings are recognised from the font sizes used in the document and become `#`, `##`, `###` and `####`
+- Columns and cards are read one after the other instead of line by line across the page
+- Bullet and numbered lists become Markdown lists
+- Tables with ruled lines become Markdown tables
+- Bold and italic text keeps its emphasis
+- Running headers, footers and page numbers are removed
+- Letter-spaced text such as `S P O O N F U L` is kept as one word
+- Embedded photos are saved at their original quality, and each photo is saved only once even when it appears on several pages
+- Vector graphics such as logos, icons, colour swatches and charts are rendered as PNG pictures
+- Pages without a text layer are OCR'd when Tesseract is installed (`brew install tesseract`), otherwise they are saved as images
 
-- Headings
-- Columns
-- Tables
-- Reading order
-- Footnotes
-- Complex layouts
-- Embedded graphics
+The result is a Markdown file that reads in the natural order of the page, with the pictures in place:
 
-Simple text-based PDFs generally convert well.
+```markdown
+# 03 Color
 
-Scanned PDFs without embedded text are not currently OCR'd.
+### Flavor Color Palette
+
+Our flavor palette pulls color straight from the table...
+
+![Page 14 graphic](images_brandbook/page14_art1.png)
+
+#### Blueberry Milk
+
+HEX: #C0C5E4 CMYK: 0.16, 0.14, 0.00, 0.11 RGB: 192, 197, 228
+```
+
+Notes:
+
+- Reading order follows the visual gaps on the page. Unusual layouts can still come out in a different order than intended
+- Text drawn inside a rendered graphic is kept in the Markdown as well, so it stays searchable
+- OCR uses English by default. Set `CONVERT_OCR_LANG` to another installed Tesseract language, for example `CONVERT_OCR_LANG=deu`
+- Without PyMuPDF the tool falls back to plain text extraction with `pdftotext`
 
 ---
 
@@ -451,12 +486,14 @@ MIT open-source license.
 
 - Bash
 - Pandoc
-- Poppler / `pdftotext`
 - Python 3
+- PyMuPDF (`pymupdf`)
 - pandas
 - openpyxl
 - xlrd
 - tabulate
+- Tesseract, optional, for scanned PDFs
+- Poppler / `pdftotext`, optional, plain-text fallback for PDFs when PyMuPDF is missing
 
 ---
 
@@ -508,16 +545,26 @@ source ~/.zshrc
 brew install pandoc
 ```
 
-### `pdftotext: command not found`
+### `Python package 'pymupdf' is not installed`
 
 ```bash
-brew install poppler
+python3 -m pip install pymupdf
 ```
+
+If pip refuses because the Python installation is "externally managed", add `--user --break-system-packages`.
 
 ### Missing Python package
 
 ```bash
-python3 -m pip install pandas openpyxl xlrd tabulate
+python3 -m pip install pandas openpyxl xlrd tabulate pymupdf
+```
+
+### A scanned PDF only produced images
+
+Install Tesseract and convert again:
+
+```bash
+brew install tesseract
 ```
 
 ---
@@ -528,8 +575,9 @@ This is intentionally a lightweight CLI utility.
 
 Current limitations include:
 
-- Scanned PDFs are not OCR'd
-- Images inside PDFs are not extracted
+- Scanned PDFs are only OCR'd when Tesseract is installed
+- PDF reading order can differ from the intended order on unusual layouts
+- Tables without ruled lines in PDFs are converted as text
 - Images in HTML files are not downloaded
 - Highly complex Word layouts may lose formatting
 - Complex Excel formatting is not preserved
@@ -545,8 +593,8 @@ Possible future improvements:
 
 - Linux installation support
 - Windows support
-- OCR for scanned PDFs
-- Image extraction from PDF
+- Table detection for PDF tables without ruled lines
+- OCR language auto-detection
 - Custom output directory
 - Overwrite confirmation
 - Dry-run mode
