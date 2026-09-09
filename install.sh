@@ -11,6 +11,23 @@ set -e
 
 INSTALL_DIR="$HOME/.local/bin"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_FILE="$SOURCE_DIR/convert"
+TEMP_FILE=""
+
+if [ ! -f "$SOURCE_FILE" ]; then
+
+    command -v curl >/dev/null 2>&1 || {
+        echo "curl is required when installing directly from GitHub."
+        exit 1
+    }
+
+    TEMP_FILE="$(mktemp)"
+    trap 'rm -f "$TEMP_FILE"' EXIT
+
+    curl -fsSL "https://raw.githubusercontent.com/leoyigit/convert-to-md/main/convert" -o "$TEMP_FILE"
+    SOURCE_FILE="$TEMP_FILE"
+
+fi
 
 echo ""
 echo "Convert to Markdown"
@@ -22,7 +39,7 @@ echo "Installing..."
 
 mkdir -p "$INSTALL_DIR"
 
-cp "$SOURCE_DIR/convert" "$INSTALL_DIR/convert"
+cp "$SOURCE_FILE" "$INSTALL_DIR/convert"
 
 chmod +x "$INSTALL_DIR/convert"
 

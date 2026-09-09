@@ -89,6 +89,22 @@ To remove the tool later, double-click **`Uninstall.command`**.
 
 ### macOS, terminal
 
+To install directly from the terminal without downloading a ZIP:
+
+```bash
+brew install pandoc poppler
+python3 -m pip install --user pandas openpyxl xlrd tabulate
+curl -fsSL https://raw.githubusercontent.com/leoyigit/convert-to-md/main/install.sh | bash
+```
+
+Open a new Terminal window, then run `convert` from anywhere.
+
+The installer places the command in `~/.local/bin` and adds that directory to
+your shell's startup file. It does not require Git or a local copy of the
+repository.
+
+For a git-based installation instead, use the steps below.
+
 Install the required system dependencies:
 
 ```bash
