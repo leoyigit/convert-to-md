@@ -87,7 +87,7 @@ If macOS says the file cannot be opened because it is from an unidentified devel
 
 To remove the tool later, double-click **`Uninstall.command`**.
 
-### macOS, terminal
+### macOS, terminal, no ZIP required
 
 To install directly from the terminal without downloading a ZIP:
 
